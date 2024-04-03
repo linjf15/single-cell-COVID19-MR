@@ -1,0 +1,233 @@
+library(TwoSampleMR)
+library(dplyr)
+library(MRInstruments)
+library(MRPRESSO)
+library(ieugwasr)
+library(daff)
+library(fdrtool)
+library(coloc)
+library(ggplot2)
+library(tidyr)
+library(locuscomparer)
+library(snpStats)
+library(GWAS.utils)
+
+#Instrument selection and Validation
+ALL_NEW_26597 <- read.csv("D:/covid19/ALL_NEW_26597.csv")
+newCOVID19_HGI_B2_eur_GRCh37 <- read.csv("D:/covid19/newCOVID19_HGI_B2_eur_GRCh37.csv")
+
+ALL_NEW_26597[["z-score"]]<- qnorm((ALL_NEW_26597$pvalue/2),lower.tail=F)
+ALL_NEW_26597[["BETA"]]<- ALL_NEW_26597$rho.correlation.coefficient/sqrt(2*ALL_NEW_26597$effect_allele_freq*(1-ALL_NEW_26597$effect_allele_freq))
+ALL_NEW_26597[["SE"]]<-abs(ALL_NEW_26597$BETA/ALL_NEW_26597$`z-score`)
+ALL_NEW_26597$exposure<- paste0(ALL_NEW_26597$Gene.ID,"_",ALL_NEW_26597$celltype)
+Exp_dat<- format_data(ALL_NEW_26597,
+                      type = "exposure",
+                      snp_col = "SNP",
+                      beta_col = "BETA",
+                      se_col = "SE",
+                      z_col = "z-score",
+                      eaf_col = "effect_allele_freq",
+                      effect_allele_col = "effect_allele",
+                      other_allele_col = "other_allele",
+                      pval_col = "pvalue",
+                      gene_col = "Gene.ID",
+                      chr_col = "Chromosome",
+                      pos_col = "Position",
+                      phenotype_col = "exposure",
+                      units_col = "Round")
+
+Exp_dat<- clump_data(Exp_dat,clump_kb = 5000,
+                     clump_r2 = 0.01,
+                     clump_p1 = 1,
+                     clump_p2 = 1,
+                     pop = "EUR")
+
+
+#Outcome selection 
+Outcome_DAT <- format_data(
+  newCOVID19_HGI_B2_eur_GRCh37,
+  type = "outcome",
+  snps =Exp_dat$SNP,
+  eaf_col = "effect_allele_freq",
+  pval_col = "p",
+  beta_col = "beta",
+  se_col = "se",
+  effect_allele_col = "effect.allele",
+  other_allele_col = "other.allele",
+  chr_col = "chr",
+  pos_col = "pos")
+
+#Two-sample Mendelian Randomization 
+#harmonization
+Mydata <- harmonise_data(
+  exposure_dat=Exp_dat,
+  outcome_dat=Outcome_DAT,
+  action= 2)
+
+Mydata$rsq.exposure<- (get_r_from_bsen(b=Mydata$beta.exposure,
+                                       Mydata$se.exposure,
+                                       Mydata$samplesize.exposure))^2
+Mydata$rsq.outcome<- (get_r_from_bsen(b=Mydata$beta.outcome,
+                                      Mydata$se.outcome,
+                                      Mydata$samplesize.outcome))^2
+Mydata$F_statistics<-(Mydata$beta.exposure)^2/(Mydata$se.exposure)^2
+Mydata<- subset(Mydata,Mydata$F_statistics>=10)
+
+res <- mr(Mydata,method_list = subset(mr_method_list("mr_wald_ratio","mr_ivw")))
+res<- res[order(res$pval),]
+res$FDR<- p.adjust(res$pval,"BH")
+res_final<- subset(res,res$FDR<0.05) 
+
+#Directionality test using MR Steiger filtering
+st_B2 <- psych::r.test( 
+  n = Mydata$samplesize.exposure, 
+  n2 = Mydata$samplesize.outcome, 
+  r12 = sqrt(Mydata$rsq.exposure), 
+  r34 = sqrt(Mydata$rsq.outcome))
+
+Mydata$steiger_dir <- Mydata$rsq.exposure > Mydata$rsq.outcome
+Mydata$steiger_pval <- pnorm(-abs(st_B2$z)) * 2 
+Mydata_B2<- left_join(res_final,Mydata,by=c("id.exposure","exposure"))
+Mydata_B2$Upper<- Mydata_B2$pos.outcome+500000
+Mydata_B2$Lower<- Mydata_B2$pos.outcome-500000
+ROUND<- ALL_NEW_26597[,c(1,3,4,8)] #with "Cell.type","Gene.Ensembl.ID", "SNP", "eSNP rank"
+ROUND$exposure<- paste0(ROUND$Gene.Ensembl.ID,"_", ROUND$Cell.type)
+ROUND<- ROUND[,c(3:5)]
+Mydata_B2<- merge(Mydata_B2,ROUND,by=c("SNP","exposure"))
+
+#Genetic colocalization and LD check analyses
+#Cochran’s Q test
+het<- mr_heterogeneity(Mydata,method_list = subset(mr_method_list("mr_ivw")))
+
+#LD check
+input <- read_excel("LD_check_input.xlsx",sheet=1) #with SNP, Position, Chromosome, Upper, Lower and outcome columns
+
+i<-1
+
+for (i in 1:nrow(input))
+{
+  print(i)
+  
+  c <- NULL 
+  d <- input[i,]
+  id <- d[1,1]
+  
+  data <- newCOVID19_HGI_B2_eur_GRCh37 %>% 
+    filter(between(pos,input$Lower[i],input$Upper[i]))
+  data <- data %>%
+    filter(!is.na(SNP))%>% filter(chr==input$chr.outcome[i])
+  
+  try(data <- data[order(data$p_value),])
+  try(data <- data[data$p_value<1E-4,])
+  
+  if (nrow(data)!=0){
+    rsid <- as.character(unlist(d[1,6]))
+    snp <- append(as.character(unlist(data$SNP)), rsid)
+
+    a <- NULL
+    attempts <- 0
+    while(attempts<=10){    
+      try(a <- ld_matrix(snp))  
+      if(is.null(a)){
+        attempts<-attempts+1}
+      else{
+        break
+      }
+    }
+    
+    if(is.null(nrow(a))==TRUE){
+      c <- as.data.frame(cbind(as.character(unlist(d[1,6])), as.character(unlist(d[1,1])),rsid, 1 ) )
+    } else {
+      col.index <- which(grepl(rsid,colnames(a)))
+      b <- (a[,col.index])^2
+      b <- b[order(b)]
+      b <- b[(length(b)-1)] 
+      c <- as.data.frame(cbind(as.character(unlist(d[1,6])),as.character(unlist(d[1,1])), names(b), as.character(unlist(b))) )
+    }
+    
+  } else {
+    c <- as.data.frame(cbind(as.character(unlist(d[1,6])), as.character(unlist(d[1,1])),"NA","NA" ) ) 
+  }
+  
+  result_file <- paste0("./ld-check/",as.character(unlist(d[1,6])),".",as.character(unlist(d[1,1])),"_ldcheck")
+  if (exists("c")==TRUE){ write.table(c,file = paste("ld check_B2", input$SNP[i],input$exposure[i] ,".csv"),sep=",",col.names=T,row.names=F,quote=F)} 
+}
+
+#Genetic colocalization analysis
+all_cell <- read.table("all_cell.txt",sep="\t",header=FALSE)
+Mydata_B2 <- read.table("Mydata_B2.txt",sep="\t",header=FALSE)
+SAMPLE_SIZE_FOR_EQTL<- read.table("sample_size.txt",sep="\t",header=FALSE) #two columns with sample size for each kind of cell type
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd4nc", "CD4 NC", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd4et", "CD4 ET", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd4SOX4", "CD4 SOX4", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="bin", "B IN", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="bmem", "B Mem", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd8nc", "CD8 NC", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd8s100b", "CD8 S100B", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="cd8et", "CD8 ET", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="dc", "DC", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="monoc", "Mono C", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="mononc", "Mono NC", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="plasma", "Plasma", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="nk", "NK", CELL_ID))
+all_cell <- all_cell %>% mutate(CELL_ID = ifelse(CELL_ID =="nkr", "NK R", CELL_ID))
+all_cell$exposure<- paste0(all_cell$GENE_ID,"_",all_cell$CELL_ID)
+
+i=1
+for (i in 1:length(Mydata_B2$SNP))
+{
+  eqtl<- all_cell %>% filter(exposure==Mydata_B2$exposure[i])
+  
+  eqtl<-eqtl %>% filter(between(POS,Mydata_B2$Lower[i]-2000000,Mydata_B2$Upper[i]+2000000))
+  
+  eqtl$variant_id<- paste0("chr",eqtl$CHR,"_",
+                           eqtl$POS,"_",
+                           eqtl$A1,"_",
+                           eqtl$A2,"_","b37")
+  
+  eqtl$maf<- eaf2maf(eqtl$A2_FREQ_ONEK1K)
+  eqtl[["z-score"]]<- qnorm((eqtl$P_VALUE/2),lower.tail=F)
+  eqtl[["BETA"]]<- eqtl$SPEARMANS_RHO/sqrt(2*eqtl$A2_FREQ_ONEK1K*(1-eqtl$A2_FREQ_ONEK1K))
+  eqtl[["se"]]<-abs(eqtl$BETA/eqtl$`z-score`)
+  eqtl$verbeta<-(eqtl$se)^2
+  eqtl$eSNP_rank<- paste0("eSNP",eqtl$ROUND)
+  N<- subset(SAMPLE_SIZE_FOR_EQTL,SAMPLE_SIZE_FOR_EQTL$CELL_ID==Mydata_B2$Cell.type[i])
+  eqtl$N<- as.numeric(N[1,2])
+  eqtl<- subset(eqtl,eqtl$eSNP_rank==Mydata_B2$eSNP.rank[i])
+  
+  gwas<- data.frame()
+  input<-data.frame()
+  result<-list()
+  dataset1<- list()
+  dataset2<- list()
+  summary<- data.frame()
+  single_snp_results<- data.frame()
+  
+  gwas <- newCOVID19_HGI_B2_eur_GRCh37 %>% filter(between(pos,Mydata_B2$Lower[i]-2000000,Mydata_B2$Upper[i]+2000000))
+  gwas<- gwas %>% filter(chr==Mydata_B2$chr.outcome[i]) %>%  filter(!is.na(SNP))
+  gwas$variant_id<- paste0("chr",gwas$chr,"_",
+                           gwas$pos,"_",
+                           gwas$`other allele`,"_",
+                           gwas$`effect allele`,"_","b37")
+  gwas$verbeta<-(gwas$se)^2
+  colnames(gwas)[1]<- "rsid"
+  colnames(eqtl)[3]<- "rsid" 
+  input <- merge(eqtl,gwas, by="rsid", all=FALSE, suffixes=c("_eqtl","_gwas"))
+  
+  result <- coloc.abf(
+    dataset1=list(pvalues=input$p, type="cc",beta=input$beta,verbeta=input$verbeta_gwas,s=input$s,N=input$n),
+    dataset2=list(pvalues=input$P_VALUE, type="quant", N=input$N,verbeta=input$verbeta_eqtl,beta=input$BETA),MAF=input$maf)
+  
+  summary<- result$summary
+  single_snp_results<- result$results
+  single_snp_results<- single_snp_results[order(single_snp_results$SNP.PP.H4,decreasing = T),]
+  m<- single_snp_results[1,2]
+  rsid<- subset(input, input$p==m)
+  c <- as.data.frame(cbind(as.character(Mydata_B2[i,11]),as.character(Mydata_B2[i,4]),as.character(Mydata_B2[i,38]),as.character(rsid[1,1]),as.character(single_snp_results[1,17]) ) ) 
+  colnames(c)[1]<- "snp"
+  colnames(c)[2]<- "exposure"
+  colnames(c)[3]<- "p"
+  colnames(c)[4]<- "col_snp"
+  colnames(c)[5]<- "col_snp_PPH4"
+  write.table(c, file = paste("TOP_single_snp_results", Mydata_B2$SNP[i],Mydata_B2$exposure[i], ".csv"), sep="," )
+}
