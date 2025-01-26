@@ -1,0 +1,102 @@
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(Seurat)
+library(monocle)
+library(ggplot2)
+library(cowplot)
+library(Matrix)
+library(dplyr)
+library(harmony)
+library(MySeuratWrappers)
+
+project<- readRDS(
+"D:\\covid19\\covid ebiomedicine 0817\\reply to reviewers\\cell.counts.matrices.rds")
+
+project<-CreateSeuratObject(counts=project$exon,
+                                     project="COVID",
+                                     min.cells=3,min.features=200)
+project[["percent.mt"]] <- PercentageFeatureSet(project,pattern = "^mt-")
+project<-NormalizeData(project,verbose = FALSE)
+project<- FindVariableFeatures(project, selection.method = "vst",nfeatures = 2000)
+HIP045<- project
+remove(project)
+
+exp.anchors<- FindIntegrationAnchors(object.list = c(severe555_1,severe555_2,severe556,
+                                                     severe557,severe558,severe559,
+                                                     severe561,HIP002,HIP015,HIP023,
+                                                     HIP043,HIP044,HIP045), dims = 1:50)
+exp.seurat <- IntegrateData(anchorset = exp.anchors, dims = 1:40)
+
+
+exp.seurat <- ScaleData(exp.seurat, verbose = FALSE)
+exp.seurat <- RunPCA(exp.seurat, npcs = 40, verbose = FALSE)
+DimPlot(exp.seurat, reduction = "pca")
+ElbowPlot(exp.seurat, ndim=40,reduction="pca")
+dim.use=1:40
+VlnPlot(exp.seurat, group.by="orig.ident",
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3)
+exp.seurat_filter <- subset(exp.seurat, 
+                            subset = 
+                              nFeature_RNA > 200 & 
+                              nCount_RNA > 200 & 
+                              nCount_RNA < 30000 &
+                              percent.mt < 5)
+
+
+exp.seurat_filter <- FindNeighbors(exp.seurat_filter, dims = dim.use)
+exp.seurat_filter <- FindClusters(exp.seurat_filter, resolution = 1.5)
+exp.seurat_filter <- RunUMAP(exp.seurat_filter, dims = dim.use, do.fast = TRUE)
+
+p1<- DimPlot(object = exp.seurat_filter,reduction = "umap",pt.size=0.1,label = T)
+p2<- DimPlot(object = exp.seurat_filter, reduction = "umap",group.by="orig.ident", pt.size=0.1)
+p3<- DimPlot(object = exp.seurat_filter, reduction = "umap",group.by="seurat_clusters", pt.size=0.1)
+p3+p2+p1
+
+all.markers<-FindAllMarkers(exp.seurat, only.pos = TRUE, 
+                            min.pct = 0.25, logfc.threshold = 0.25)
+marker.sig <- all.markers %>% filter(p_val_adj <= 0.05)
+top5 <- marker.sig %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+DotPlot(exp.seurat, features = unique(top5$gene))+RotatedAxis()
+
+a<- exp.seurat_har@meta.data
+a$subgroup<- "diabetes"
+a[which(a$orig.ident == "ND_G26"),'group'] <- "Normal"
+a[which(a$orig.ident == "ND_G20"),'group'] <- "Normal"
+a[which(a$orig.ident == "ND_G30"),'group'] <- "Normal"
+a <- a %>% mutate(subgroup = ifelse(subgroup =="DM_G19","diabetes" , subgroup))
+
+Idents(exp.seurat_har) =(exp.seurat_har$integrated_snn_res.1)
+table(Idents(exp.seurat_har))
+
+# harmony process
+exp.seurat_har <- exp.seurat_filter %>%
+  RunHarmony("orig.ident",plot_convergence = TRUE)
+exp.seurat_har@reductions$harmony
+harmony_embeddings <- Embeddings(exp.seurat_har,'harmony') 
+harmony_embeddings[1:5,1:5]
+options(repr.plot.height = 5, repr.plot.width =12)
+p1 <- DimPlot(object = exp.seurat_har, reduction = "harmony", pt.size = .1, group.by = "orig.ident") 
+p2 <- VlnPlot(object = exp.seurat_har, features = "harmony_1", group.by = "orig.ident", pt.size =.1) 
+plot_grid(p1,p2)
+
+exp.seurat_har <- exp.seurat_har %>%
+  RunUMAP(reduction = "harmony", dims = 1:40) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:40) %>% FindClusters(resolution =1.5) %>% identity()
+
+options(repr.plot.height = 4, repr.plot.width=10)
+DimPlot(exp.seurat_har,reduction = "umap", pt.size =0.1,label = T)
+#DimPlot(exp.seurat_har,reduction = "umap", pt.size =0.1,label = T,
+        cells.highlight = WhichCells(exp.seurat_har, 
+                                     idents = c("18"))) #highlight selected cells
+
+# DEG analysis
+cellfordeg<-levels(exp.seurat_har$celltype)
+for(i in 1:length(cellfordeg)){
+  CELLDEG <- FindMarkers(exp.seurat_har, ident.1 = paste0(cellfordeg[i],"_MS"), 
+                         ident.2 = paste0(cellfordeg[i],"_CON"),assay = "RNA",
+                         min.pct = 0,logfc.threshold =0 ,verbose = FALSE)
+  write.csv(CELLDEG,paste0("RNA_",cellfordeg[i],".CSV"))
+}
+list.files()
