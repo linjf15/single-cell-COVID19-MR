@@ -1,0 +1,477 @@
+library(TwoSampleMR)
+library(dplyr)
+library(MRInstruments)
+library(MRPRESSO)
+library(ieugwasr)
+library(daff)
+library(fdrtool)
+library(coloc)
+library(ggplot2)
+library(tidyr)
+library(locuscomparer)
+library(snpStats)
+library(GWAS.utils)
+library(LDlinkR)
+library(tidyverse)
+library(MungeSumstats)
+library(ggforestplot)
+library(data.table)b
+library(GTExIdConverter)
+library(arrow)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh37)
+library(BSgenome)
+library(tidyverse)
+library(rentrez)
+#add function for transforming chr_pos to rsid 
+get_rsID_from_chrpos <- function(dat,
+                                 col_chr = "chr",
+                                 col_pos = "start",
+                                 col_ref_allele = "refAllele",
+                                 col_alt_allele = "altAllele",
+                                 col_snp = "SNP",
+                                 build = "38",
+                                 pop = "EUR",
+                                 database = "dbsnp")
+{
+  stopifnot(database %in% c("ensembl","dbsnp"))
+  library(tidyverse) 
+  if(database == "ensembl")
+  {
+    # Create and get a url
+    server <- ifelse(build == "38",
+                     "http://grch38.rest.ensembl.org",
+                     "http://rest.ensembl.org")
+    
+    query_term <- paste0(
+      server,"/vep/human/region/",dat[[col_chr]],":",
+      dat[[col_pos]],"-",dat[[col_pos]],"/",dat[[col_alt_allele]],"?")
+    
+    query_term_alt <- paste0(
+      server,"/vep/human/region/",dat[[col_chr]],":",
+      dat[[col_pos]],"-",dat[[col_pos]],"/",dat[[col_ref_allele]],"?")
+    
+    dat[[col_snp]] <- lapply(1:nrow(dat), function(i)
+    {
+      print(paste0("searching for No. ", i, " SNP"))
+      query_res <- httr::GET(query_term[i], httr::content_type("application/json"))
+      
+      httr::warn_for_status(query_res)
+      
+      # Convert R objects from JSON
+      query_res <- httr::content(query_res)
+      res_df <- jsonlite::fromJSON(jsonlite::toJSON(query_res))
+      snp <- res_df$colocated_variants[[1]][["id"]][[1]]
+      if(is.null(snp))
+      {
+        query_res <- httr::GET(query_term_alt[i], httr::content_type("application/json"))
+        httr::warn_for_status(query_res)
+        
+        # Convert R objects from JSON
+        query_res <- httr::content(query_res)
+        res_df <- jsonlite::fromJSON(jsonlite::toJSON(query_res))
+        snp <- res_df$colocated_variants[[1]][["id"]][[1]]
+        if(is.null(snp)) return(NA)
+        else return(snp)
+      }
+      else return(snp)
+      
+      #alleles <- unlist(str_split(res_df$allele_string[[1]],"/"))
+      #ref_allele <- unlist(res_df$colocated_variants[[1]]$minor_allele)
+      #alt_allele <- alleles[alleles != ref_allele]
+      #alt_allele_freq <-res_df$colocated_variants[[1]][["frequencies"]][[alt_allele]][[str_to_lower("EUR")]][[1]]
+    }
+    )
+    
+    dat[[col_snp]] <- unlist(dat[[col_snp]])
+  }
+  
+  
+  if(database == "dbsnp")
+  {
+    search_build <- ifelse(build == "38","[POSITION_GRCH38]","[Base Position]")
+    
+    query_term <- paste0(dat[[col_chr]],"[CHR] AND Homo[ORGN] AND ",
+                         dat[[col_pos]],search_build)
+    
+    SNP <- lapply(1:nrow(dat), function(i)
+    {
+      print(paste0("searching for No. ", i, " SNP"))
+      snp <- unlist(rentrez::entrez_search(db="snp", term=query_term[i])$ids)
+      if(is.null(snp)) return(NA)
+      else return(paste0("rs",snp[length(snp)]))
+    }
+    )
+    
+    dat[[col_snp]] <- unlist(SNP)
+    
+    if(nrow(dat) != length(SNP[!is.na(SNP)]))
+    {
+      dat_with_snp <- dat[!is.na(dat[[col_snp]]),]
+      dat_without_snp <- dat[is.na(dat[[col_snp]]),]
+      query_term_alt <- paste0(dat_without_snp[[col_chr]],"[CHR] AND Homo[ORGN] AND ",
+                               dat_without_snp[[col_pos]]+1,search_build)
+      SNP <- lapply(1:nrow(dat_without_snp), function(i)
+      {
+        print(paste0("Researching for No. ", i, " SNP"))
+        snp <- unlist(rentrez::entrez_search(db="snp", term=query_term_alt[i])$ids)
+        if(is.null(snp)) return(NA)
+        else return(paste0("rs",snp[length(snp)]))
+      }
+      )
+      dat_without_snp[[col_snp]] <- unlist(SNP)
+      dat <- rbind(dat_with_snp, dat_without_snp)
+    }
+  }
+  dat
+}
+
+# re-format outcome data with b38 chr & pos
+setwd("H:\\covid\\COVID HGI OUTCOME DATA\\round7")
+a <- list.files()  
+dir <- paste("./",a,sep="")   
+n <- length(dir)
+i=1
+for (i in n) {
+  covid_id<- a[i]
+  covid<- fread(file =a[i],sep="\t",header=T)
+  covid<- as.data.frame(covid)  
+  covid[1,]
+  colnames(covid)[1]<- "CHR"
+  colnames(covid)[2]<- "POS"
+  colnames(covid)[3]<- "oa"
+  colnames(covid)[4]<- "ea"
+  colnames(covid)[7]<- "beta"
+  colnames(covid)[8]<- "se"
+  colnames(covid)[9]<- "p"
+  colnames(covid)[10]<- "case"
+  colnames(covid)[11]<- "control"
+  colnames(covid)[14]<- "eaf"
+  colnames(covid)[15]<- "SNP"
+  colnames(covid)[16]<- "CHR_b38"
+  colnames(covid)[17]<- "POS_b38"
+  colnames(covid)[18]<- "oa_b38"
+  colnames(covid)[19]<- "ea_b38"
+  covid[1,]
+  covid_final<- covid[,c(15,1:4,14,7:11,16:19)]
+  covid_final$outcome<- covid_id
+  covid_final[1,]
+  write.table(covid_final, file=paste(covid_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+   }
+
+
+# format exposure
+setwd("H:\\covid\\gtex\\GTEx_Analysis_v10_eQTL")
+gtf_data = import('gencode.v39.GRCh38.genes.gtf')
+gtf_data = as.data.frame(gtf_data)
+WholeGenomeSeq<- GTEx_Analysis_2021.02.11_v10_WholeGenomeSeq_953Indiv.lookup_table.txt
+remove(GTEx_Analysis_2021.02.11_v10_WholeGenomeSeq_953Indiv.lookup_table.txt)
+WholeGenomeSeq<- WholeGenomeSeq[,c(1,7,8)]
+
+n=50
+i=1
+for (i in 1:n) {
+  setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\sig_pairs")
+  a <- list.files()  
+  dir <- paste("./",a,sep="")   
+  n <- length(dir)
+  gtex_id<- a[i]
+  gtex_EUR<- read_parquet(file =a[i])
+  gtex_EUR<- as.data.frame(gtex_EUR)  
+  gtex_EUR[1,]
+  gtex_EUR$phenotype<-substring(gtex_EUR$gene_id, 1, 15)
+  gtex_IVS<- subset(gtex_EUR,gtex_EUR$phenotype %in% GTEX_GENOTYPE$`Gene Ensembl ID`)
+  remove(gtex_EUR)
+  gc()
+  
+  gtex_IVS<- subset(gtex_IVS,gtex_IVS$pval_nominal <0.001)
+  gtex_IVS<- left_join(gtex_IVS,WholeGenomeSeq,by="variant_id")
+  gc()
+  colnames(gtex_IVS)[colnames(gtex_IVS) == "rs_id_dbSNP155_GRCh38p13"] <- "rsid"
+  gtex_IVS<- separate(gtex_IVS,variant_id,into = c("chr","pos","oa","ea","version"),sep = "_")
+  gtex_IVS[1,]
+  gtex_IVS<- subset(gtex_IVS,select=c("gene_id","chr","pos","oa","ea","af","pval_nominal",
+                                      "slope","slope_se","phenotype","rsid","variant_id_b37"))
+  gtex_IVS$samplesize<- GTEx_Portal$samplesize[i]
+  gtex_IVS$SNP<-gtex_IVS$rsid
+  gtex_IVS$chr<-substring(gtex_IVS$chr, 4, 5)
+  gtex_IVS$chr<- as.numeric(gtex_IVS$chr)
+  gtex_IVS$pos<- as.numeric(gtex_IVS$pos)
+  gtex_IVS[1,]
+  gc()
+  
+  gtex_IVS <- format_data(
+    gtex_IVS,
+  type = "exposure",
+  snp_col = "SNP",
+  eaf_col = "af",
+  pval_col = "pval_nominal",
+  beta_col = "slope",
+  se_col = "slope_se",
+  effect_allele_col = "ea",
+  other_allele_col = "oa",
+  chr_col = "chr",
+  pos_col = "pos",
+  samplesize_col = "samplesize",
+  phenotype_col = "phenotype",
+  info_col = "variant_id_b37")
+  gtex_IVS[1,]
+  
+
+  gtex_needto_trans<-gtex_IVS[gtex_IVS$SNP==".",] 
+  gtex_rest<- gtex_IVS[gtex_IVS$SNP!=".",] 
+  gc()
+  
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="chr.exposure"]<-"CHR"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="pos.exposure"]<-"POS"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="other_allele.exposure"]<-"A1"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="effect_allele.exposure"]<-"A2"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="eaf.exposure"]<-"EAF"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="pval.exposure"]<-"Pval"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="beta.exposure"]<-"Beta"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="se.exposure"]<-"SE"
+  test<- gtex_needto_trans[,1:8]
+  
+  test <- get_rsID_from_chrpos(test,
+                                   col_chr = "CHR",
+                                   col_pos = "POS",
+                                   col_ref_allele = "A1",
+                                   col_alt_allele = "A2",
+                                   col_snp = "SNP",       
+                                   build = "38",
+                                   pop = "EUR",
+                                   database = "dbsnp") 
+  gc()
+  gtex_needto_trans<- left_join(gtex_needto_trans,test,
+                                by=c("CHR","POS","A1","A2","EAF","Pval","Beta","SE"))
+  
+  gtex_needto_trans$SNP.x<- gtex_needto_trans$SNP.y
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="SNP.x"]<-"SNP"
+  gtex_needto_trans$SNP.y<- NULL
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="CHR"]<-"chr.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="POS"]<-"pos.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="A1"]<-"other_allele.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="A2"]<-"effect_allele.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="EAF"]<-"eaf.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="Pval"]<-"pval.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="Beta"]<-"beta.exposure"
+  colnames(gtex_needto_trans)[colnames(gtex_needto_trans)=="SE"]<-"se.exposure"
+  gtex_exp_NEW<- rbind(gtex_rest,gtex_needto_trans)
+  gtex_IVS<- gtex_exp_NEW
+  
+  colnames(gtex_IVS)[colnames(gtex_IVS) == "SNP"] <- "rsid"
+  colnames(gtex_IVS)[colnames(gtex_IVS) == "pval.exposure"] <- "pval"
+  
+  gtex_exp_1<- ld_clump_local(gtex_IVS,clump_kb = 5000,
+                       clump_r2 = 0.01,
+                       clump_p  = 1,
+                       bfile="H:/covid/reply_to_ebio/gtex/g1000_eur/g1000_eur/g1000_eur", 
+                       plink_bin="H:/covid/reply_to_ebio/gtex/plink_win64_20231211/plink"
+                       )
+  gc()
+  gtex_exp_2<- gtex_IVS[!gtex_IVS$id.exposure %in% gtex_exp_1$id.exposure,]
+  gtex_exp_2<- gtex_exp_2[order(gtex_exp_2$pval),]
+  gtex_exp_3 <- gtex_exp_2[!duplicated(gtex_exp_2$id.exposure),]
+  gtex_exp_final<- rbind(gtex_exp_1,gtex_exp_3)
+  
+  setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\exp.dat")
+  write.table(gtex_exp_final, paste0("EXP.dat ",gtex_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+  length(unique(gtex_exp_final$id.exposure))
+  length(unique(gtex_IVS$id.exposure))
+  } 
+ 
+# MR process 
+GTEx_samplesize <- read_excel("H:/covid/reply_to_ebio/gtex/GTEx_Analysis_v10_eQTL/GTEx samplesize.xlsx",sheet = "eqtl")
+
+setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\exp.dat")
+ a <- list.files()  
+ dir <- paste("./",a,sep="")   
+ n <- length(dir)
+ i=1
+ for (i in 1:n)
+{ 
+ setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\exp.dat")
+ exp_id<- GTEx_samplesize$phenotype_name[i]
+ exp = read.table(file = dir[i], sep ='\t',header = T)  
+ colnames(exp)[colnames(exp) == "rsid"] <- "SNP"
+ colnames(exp)[colnames(exp) == "pval"] <- "pval.exposure"
+ print(exp_id)
+setwd("H:\\covid\\OUTCOME\\covid outcome")
+ b <- list.files() 
+ dir_out <- paste("./",b,sep="")
+ w=1
+ for (w in 1:4)
+{ 
+  setwd("H:\\covid\\OUTCOME\\covid outcome")
+  out_id<- substring(as.name(b[w]), 1, 19)
+  out = fread(file = b[w], sep ='\t',header = T)  
+  out<- as.data.frame(out)
+  gc()
+  out <- out[,c(1,6:15)]
+  out$samplesize<- out$case+out$control
+  out[1,]
+  print(out_id)
+  out_dat<- format_data(
+   out,
+   type = "outcome",
+   snps =exp$SNP,
+   eaf_col = "eaf",
+   pval_col = "p",
+   beta_col = "beta",
+   se_col = "se",
+   effect_allele_col = "ea_b38",
+   other_allele_col = "oa_b38",
+   chr_col = "CHR_b38",
+   pos_col = "POS_b38",
+   samplesize_col = "samplesize",
+   ncase_col = "case",
+   ncontrol_col = "control" )
+   
+   gc()
+
+   #har_data
+  Mydata <- harmonise_data(
+    exposure_dat=exp,
+    outcome_dat=out_dat,
+    action= 2)
+
+
+  Mydata$rsq.exposure<- (get_r_from_bsen(b=Mydata$beta.exposure,
+                                       Mydata$se.exposure,
+                                       Mydata$samplesize.exposure))^2
+  Mydata$rsq.outcome<- (get_r_from_bsen(b=Mydata$beta.outcome,
+                                      Mydata$se.outcome,
+                                      Mydata$samplesize.outcome))^2
+  Mydata$F_statistics<-(Mydata$beta.exposure)^2/(Mydata$se.exposure)^2
+  Mydata<- subset(Mydata,Mydata$F_statistics>=10)
+
+  res <- mr(Mydata,method_list = c("mr_wald_ratio","mr_ivw"))
+  res<- res[order(res$pval),]
+  res$FDR<- p.adjust(res$pval,"BH")
+  res_final<- subset(res,res$pval<0.05) 
+
+#Directionality test using MR Steiger filtering
+  st <- psych::r.test( 
+   n = Mydata$samplesize.exposure, 
+   n2 = Mydata$samplesize.outcome, 
+   r12 = sqrt(Mydata$rsq.exposure), 
+   r34 = sqrt(Mydata$rsq.outcome))
+
+  Mydata$steiger_dir <- Mydata$rsq.exposure > Mydata$rsq.outcome
+  Mydata$steiger_pval <- pnorm(-abs(st$z)) * 2 
+  Mydata_res<- left_join(res_final,Mydata,by=c("id.exposure","exposure"))
+  Mydata_res$Upper<- Mydata_res$pos.outcome+500000
+  Mydata_res$Lower<- Mydata_res$pos.outcome-500000
+  Mydata_res$outcome.x<- out_id
+  Mydata_res$outcome.y<- NULL
+  Mydata_res$id.outcome.y<- NULL
+  colnames(Mydata_res)[colnames(Mydata_res)=="outcome.x"]<- "outcome"
+  colnames(Mydata_res)[colnames(Mydata_res)=="id.outcome.x"]<- "id.outcome"
+  Mydata_res[1,]
+  
+
+ #ld check
+ input<-subset(Mydata_res,select=c("outcome","SNP","chr.outcome","pos.outcome","Upper","Lower"))
+ input<- unique(input)
+ 
+ m<-1
+ for (m in 1:nrow(input))
+ {
+   print(m)
+   
+   c <- NULL 
+   d <- input[m,]
+   
+   data <- out %>% 
+     filter(between(POS_b38,input$Lower[m],input$Upper[m]))
+   data <- data %>%
+     filter(!is.na(SNP))%>% filter(CHR_b38==input$chr[m])
+   
+   try(data <- data[order(data$p),])
+   try(data <- data[data$p<1E-4,])
+   if(nrow(data)>=500){try((data1 <- data[1:499,]))}else{data1 <- data}
+   
+   if (nrow(data1)!=0){
+     rsid <- as.character(unlist(d[1,2]))
+     snp <- append(as.character(unlist(data1$SNP)), rsid)
+     snp<- unique(snp)
+     
+     f <- NULL
+     attempts <- 0
+     while(attempts<=10){    
+       try(f <- ld_matrix(snp))  
+       if(is.null(f)){
+         attempts<-attempts+1}
+       else{
+         break
+       }
+     }
+     
+     #If the number of snps in "data" exceeds 500, please analyze it in segments (each segment up to 499 SNPs and should also append with "rsid" character)
+     
+     
+     if(is.null(nrow(f))==TRUE){
+       c <- as.data.frame(cbind(as.character(unlist(d[1,2])),rsid, 1 ) )
+     } else {
+       col.index <- which(grepl(rsid,colnames(f)))
+       g <- (f[,col.index])^2
+       g <- g[order(g)]
+       g <- g[(length(g)-1)] 
+       c <- as.data.frame(cbind(as.character(unlist(d[1,2])), names(g), as.character(unlist(g))) )
+     }
+     
+   } else {
+     c <- as.data.frame(cbind(as.character(unlist(d[1,2])), "NA","NA" ) ) 
+   }
+   
+   setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\gtex ld check")
+   if (exists("c")==TRUE){ write.table(c,file = paste("ld check_", input$SNP[m],exp_id," to ",out_id,".csv"),sep=",",col.names=T,row.names=F,quote=F)} 
+  }
+
+ setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\gtex mr res")
+ write.table(exp, paste0("Exp_dat ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ write.table(out_dat, paste0("Out_dat ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ write.table(Mydata, paste0("Mydata ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ write.table(res, paste0("res ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ write.table(res_final, paste0("res_final ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ write.table(Mydata_res, paste0("Mydata_res ",exp_id," to ",out_id,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ }
+ 
+}
+ 
+ i=1
+ for(i in 1:50){
+   dir.create(as.character(GTEx_samplesize[i,3]))
+ }
+ 
+ 
+ 
+  #write.table(Mydata, file = paste("Mydata", Mydata$celltype.exposure[i], ".csv"), sep="," )
+  setwd("H:\\covid\\reply_to_ebio\\gtex\\GTEx_Analysis_v10_eQTL\\GTEx_Analysis_v10_eQTL_updated\\gtex ld check")
+  a <- list.files()  
+  dir <- paste("./",a,sep="")   
+  n <- length(dir)
+  
+  merge.data = read.table(file = dir[1], sep = ',',header = T)  
+  colnames(merge.data)[1]<- "V1"
+  colnames(merge.data)[2]<- "V2"
+  colnames(merge.data)[3]<- "V3"
+  merge.data$V4<- a[1]
+  
+  
+  phenotype_1<- as.character(GTEx_samplesize[1,3])
+  merge.data$tissue<-phenotype_1
+  
+  for (w in 2:n){
+    new.data <- read.table(file = dir[w], sep = ',',header = T)  
+    if(ncol(new.data)==1){
+      new.data$V2<- "NA"
+      new.data$V3<- "NA"
+    }else{new.data <-new.data}
+    colnames(new.data)[1]<- "V1"
+    colnames(new.data)[2]<- "V2"
+    colnames(new.data)[3]<- "V3"
+    new.data$V4<- a[w]
+    #phenotype<- as.character(GTEx_samplesize[w,3])
+    #new.data$tissue<-phenotype
+    merge.data <- rbind(merge.data,new.data)}  
+  write.csv(merge.data,file = "./merge_all_covid_gtex_ld_check_final_results.csv",row.names=FALSE)  
