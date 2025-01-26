@@ -1,0 +1,152 @@
+library(MendelianRandomization)
+library(TwoSampleMR)
+library(dplyr)
+library(MRInstruments)
+library(MRPRESSO)
+library(ieugwasr)
+library(daff)
+library(fdrtool)
+library(coloc)
+library(ggplot2)
+library(tidyr)
+library(locuscomparer)
+library(snpStats)
+library(GWAS.utils)
+library(LDlinkR)
+library(tidyverse)
+library(MungeSumstats)
+library(ggforestplot)
+library(data.table)
+library(tidyverse)
+
+setwd('H:\\covid\\new onek1k\\onek1k tsv')
+all_cell <- fread(file = "all_cell.txt",sep="\t",
+                    select = c("CELL_ID","RSID","SPEARMANS_RHO","GENE_ID","CHR","POS",
+                               "A1","A2","A2_FREQ_ONEK1K","P_VALUE","ROUND"))
+week_ivs<- subset(week_ivs_need_select, Cell.type==Celltype)
+week_ivs<- separate(week_ivs,ROUND,into = c("eSNP","ROUND"),sep = "P")
+
+v=1
+for (v in 1:nrow(week_ivs))
+{ 
+  new_ivs<- all_cell %>% filter(exposure==week_ivs$exposure[v])
+  new_ivs<- subset(new_ivs, P_VALUE <0.05)
+  new_ivs<- subset(new_ivs, ROUND %in% week_ivs$ROUND[v])
+  
+  new_ivs[["z-score"]]<- qnorm((new_ivs$P_VALUE/2),lower.tail=F)
+  new_ivs[["BETA"]]<- new_ivs$SPEARMANS_RHO/sqrt(2*new_ivs$A2_FREQ_ONEK1K*(1-new_ivs$A2_FREQ_ONEK1K))
+  new_ivs[["SE"]]<-abs(new_ivs$BETA/new_ivs$`z-score`)
+  new_ivs <- data.frame(new_ivs) 
+  new_ivs$samplesize<- week_ivs$samplesize.exposure[v]
+  
+  Exp_dat<- format_data(new_ivs,
+                        type = "exposure",
+                        snp_col = "RSID",
+                        beta_col = "BETA",
+                        se_col = "SE",
+                        z_col = "z-score",
+                        eaf_col = "A2_FREQ_ONEK1K",
+                        effect_allele_col = "A2",
+                        other_allele_col = "A1",
+                        pval_col = "P_VALUE",
+                        gene_col = "Gene.ID",
+                        chr_col = "CHR",
+                        pos_col = "POS",
+                        phenotype_col = "exposure",
+                        units_col = "Round",
+                        samplesize_col = "samplesize")
+  
+  Exp_dat<- clump_data(Exp_dat,clump_kb = 5000,
+                       clump_r2 = 0.01,
+                       clump_p1 = 1,
+                       clump_p2 = 1,
+                       pop = "EUR")
+w=1
+  for(w in 1:4)
+  { 
+setwd("D:\\covid19\\20231204\\OUTCOME")
+    outcome_name <- list.files()  
+    outcome_name<- outcome_name[w]
+    outcome_id<- fread(file =paste0(outcome_name),sep=",")
+    outcome_id<- as.data.frame(outcome_id)
+
+  Outcome_DAT <- format_data(
+    outcome_id,
+    type = "outcome",
+    snps =Exp_dat$SNP,
+    eaf_col = "effect_allele_freq",
+    pval_col = "p",
+    beta_col = "beta",
+    se_col = "se",
+    effect_allele_col = "effect.allele",
+    other_allele_col = "other.allele",
+    chr_col = "chr",
+    pos_col = "pos",
+    samplesize_col = "n")
+  
+  Mydata <- harmonise_data(
+    exposure_dat=Exp_dat,
+    outcome_dat=Outcome_DAT,
+    action= 2)
+  
+  Mydata$rsq.exposure<- (get_r_from_bsen(b=Mydata$beta.exposure,
+                                         Mydata$se.exposure,
+                                         Mydata$samplesize.exposure))^2
+  Mydata$rsq.outcome<- (get_r_from_bsen(b=Mydata$beta.outcome,
+                                        Mydata$se.outcome,
+                                        Mydata$samplesize.outcome))^2
+  
+
+  #Directionality test using MR Steiger filtering
+  st <- psych::r.test( 
+    n = Mydata$samplesize.exposure, 
+    n2 = Mydata$samplesize.outcome, 
+    r12 = sqrt(Mydata$rsq.exposure), 
+    r34 = sqrt(Mydata$rsq.outcome))
+  
+  Mydata$steiger_dir <- Mydata$rsq.exposure > Mydata$rsq.outcome
+  Mydata$steiger_pval <- pnorm(-abs(st$z)) * 2 
+  Mydata$Upper<- Mydata$pos.exposure+500000
+  Mydata$Lower<- Mydata$pos.exposure-500000
+  
+  res <- mr.divw(beta.exposure = Mydata$beta.exposure,beta.outcome = Mydata$beta.outcome,
+                 se.exposure = Mydata$se.exposure,se.outcome = Mydata$se.outcome)
+  res<- as.data.frame(res)
+  res<- res[1,]
+  res$exposure<- week_ivs$X[v]
+  res$z<- res$beta.hat/res$beta.se
+  res$pval<- 2*pnorm(q=abs(res$z),lower.tail = FALSE)
+  
+  p_res<- mr_penalised_weighted_median(b_exp = Mydata$beta.exposure,b_out = Mydata$beta.outcome,
+                                       se_exp = Mydata$se.exposure,se_out = Mydata$se.outcome)
+  
+  p_res<- as.data.frame(p_res)
+  p_res<- p_res[1,]
+  p_res$exposure<- week_ivs$X[v]
+  
+  setwd("H:\\covid\\reply to ebio\\divw_iv_selec\\divw res")
+  write.table(Mydata, paste0("Mydata ",week_ivs$X[v],outcome_name,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+  write.table(res, paste0("res ",week_ivs$X[v],outcome_name,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+  write.table(Exp_dat, paste0("Exp_dat ",week_ivs$X[v],outcome_name,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+  write.table(Outcome_DAT, paste0("Outcome_DAT ",week_ivs$X[v],outcome_name,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+  write.table(p_res, paste0("p_res ",week_ivs$X[v],outcome_name,".txt"), row.names = FALSE, sep = '\t', quote = FALSE)
+ }
+}
+
+setwd("H:\\covid\\divw_iv_selec\\divw res\\mydata")
+a <- list.files()  
+dir <- paste("./",a,sep="")   
+n <- length(dir)
+
+r=1
+for (r in 1:n){
+  Mydata = read.table(file = a[r], sep = '\t',header = TRUE)  
+  p_res<- mr_penalised_weighted_median(b_exp = Mydata$beta.exposure,b_out = Mydata$beta.outcome,
+                                       se_exp = Mydata$se.exposure,se_out = Mydata$se.outcome)
+  
+  p_res<- as.data.frame(p_res)
+  p_res<- p_res[1,]
+  p_res$exposure<- a[r]
+  
+  write.csv(p_res,file = paste0("p_res ",a[r],".csv"),row.names=FALSE) 
+}  
